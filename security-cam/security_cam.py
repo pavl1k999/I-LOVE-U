@@ -160,6 +160,8 @@ def uninstall():
     powershell(f"""
 Stop-ScheduledTask -TaskName '{APP}' -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName '{APP}' -Confirm:$false -ErrorAction SilentlyContinue
+Get-Process -Name '{APP}' -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.Id -notin @({os.getpid()}, {os.getppid()}) }} | Stop-Process -Force
 Remove-NetFirewallRule -DisplayName '{APP} stream' -ErrorAction SilentlyContinue
 """)
     msgbox("Программа удалена из автозапуска, запись остановлена.\n"
