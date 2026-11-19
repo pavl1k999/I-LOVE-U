@@ -1,4 +1,4 @@
-# Устанавливает задачу планировщика "SecurityCam": запуск записи при включении ПК (ещё до входа в систему).
+﻿# Устанавливает задачу планировщика "SecurityCam": запуск записи при включении ПК (ещё до входа в систему).
 $ErrorActionPreference = 'Stop'
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script = Join-Path $dir 'security_cam.py'
