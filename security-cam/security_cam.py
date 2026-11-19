@@ -1,13 +1,12 @@
 """
-Security Cam — один exe-файл.
+Security Cam — один exe-файл. Только онлайн-трансляция, без записи на диск.
 
 Двойной щелчок по SecurityCam.exe:
-  * не установлено  -> устанавливает автозапуск при включении ПК и сразу начинает запись;
+  * не установлено  -> ставит автозапуск при включении ПК и запускает трансляцию;
   * уже установлено -> предлагает удалить.
 
-Запись видео идёт в папку recordings рядом с exe, живая трансляция — в браузере.
-Если в config.ini указан Telegram-бот, при старте трансляции придёт одно
-сообщение со ссылкой.
+Живая трансляция открывается в браузере. Если в config.ini указан Telegram-бот,
+при каждом запуске ПК приходит ОДНО сообщение: ссылка, логин и пароль.
 """
 
 import os
@@ -23,7 +22,7 @@ import subprocess
 import configparser
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -34,7 +33,7 @@ FROZEN = getattr(sys, "frozen", False)
 EXE = Path(sys.executable if FROZEN else __file__).resolve()
 BASE = EXE.parent
 CONFIG = BASE / "config.ini"
-OUTPUT_DIR = BASE / "recordings"
+LOG_FILE = BASE / "security_cam.log"
 
 DEFAULT_CONFIG = """\
 ; ===== Настройки Security Cam =====
@@ -45,10 +44,6 @@ index = 0
 width = 1280
 height = 720
 fps = 20
-
-[recording]
-segment_minutes = 10
-retention_days = 7
 
 [stream]
 port = 8080
@@ -77,20 +72,17 @@ def load_config():
 
 
 cfg = load_config()
-CAMERA_INDEX    = cfg.getint("camera", "index", fallback=0)
-WIDTH           = cfg.getint("camera", "width", fallback=1280)
-HEIGHT          = cfg.getint("camera", "height", fallback=720)
-FPS             = cfg.getint("camera", "fps", fallback=20)
-SEGMENT_MINUTES = cfg.getint("recording", "segment_minutes", fallback=10)
-RETENTION_DAYS  = cfg.getint("recording", "retention_days", fallback=7)
-STREAM_PORT     = cfg.getint("stream", "port", fallback=8080)
-STREAM_USER     = cfg.get("stream", "user", fallback="admin").strip()
-STREAM_PASS     = cfg.get("stream", "password", fallback="").strip()
-TG_TOKEN        = cfg.get("telegram", "token", fallback="").strip()
-TG_CHAT_ID      = cfg.get("telegram", "chat_id", fallback="").strip()
+CAMERA_INDEX = cfg.getint("camera", "index", fallback=0)
+WIDTH        = cfg.getint("camera", "width", fallback=1280)
+HEIGHT       = cfg.getint("camera", "height", fallback=720)
+FPS          = cfg.getint("camera", "fps", fallback=20)
+STREAM_PORT  = cfg.getint("stream", "port", fallback=8080)
+STREAM_USER  = cfg.get("stream", "user", fallback="admin").strip()
+STREAM_PASS  = cfg.get("stream", "password", fallback="").strip()
+TG_TOKEN     = cfg.get("telegram", "token", fallback="").strip()
+TG_CHAT_ID   = cfg.get("telegram", "chat_id", fallback="").strip()
 
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(filename=OUTPUT_DIR / "security_cam.log", level=logging.INFO,
+logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cam")
 if sys.stdout:
@@ -149,11 +141,11 @@ Start-ScheduledTask -TaskName '{APP}'
     if r.returncode != 0:
         msgbox("Не удалось установить:\n\n" + (r.stderr or r.stdout)[-800:])
         return
-    msgbox("✅ Установлено! Запись уже идёт и будет включаться при каждом запуске ПК.\n\n"
-           f"Видео: {OUTPUT_DIR}\n\n"
+    tg = "\n\nСсылка, логин и пароль отправлены в Telegram." if (TG_TOKEN and TG_CHAT_ID) else ""
+    msgbox("✅ Установлено! Трансляция будет включаться при каждом запуске ПК.\n\n"
            f"Трансляция: {stream_url(local_ip())}\n"
            f"Логин: {STREAM_USER}\nПароль: {STREAM_PASS}\n\n"
-           "(всё это есть в config.ini)")
+           "(всё это есть в config.ini)" + tg)
 
 
 def uninstall():
@@ -164,8 +156,7 @@ Get-Process -Name '{APP}' -ErrorAction SilentlyContinue |
     Where-Object {{ $_.Id -notin @({os.getpid()}, {os.getppid()}) }} | Stop-Process -Force
 Remove-NetFirewallRule -DisplayName '{APP} stream' -ErrorAction SilentlyContinue
 """)
-    msgbox("Программа удалена из автозапуска, запись остановлена.\n"
-           "Записанные видео остались в папке recordings.")
+    msgbox("Программа удалена из автозапуска, трансляция остановлена.")
 
 
 # ================= СЕТЬ / TELEGRAM =================
@@ -197,7 +188,7 @@ def stream_url(ip):
 
 
 def notify_stream_started():
-    """Одно сообщение в Telegram: трансляция началась + ссылка. Повторяет, пока нет интернета."""
+    """Одно сообщение в Telegram: ссылка, логин и пароль. Повторяет, пока нет интернета."""
     if not (TG_TOKEN and TG_CHAT_ID):
         return
 
@@ -205,10 +196,12 @@ def notify_stream_started():
         delay = 5
         while True:
             lines = [f"🔴 Трансляция началась ({datetime.now():%d.%m.%Y %H:%M})",
-                     stream_url(local_ip())]
+                     "",
+                     f"Ссылка: {stream_url(local_ip())}"]
             ts = tailscale_ip()
             if ts:
-                lines.append(stream_url(ts) + "  (через Tailscale)")
+                lines.append(f"Через интернет (Tailscale): {stream_url(ts)}")
+            lines += ["", f"Логин: {STREAM_USER}", f"Пароль: {STREAM_PASS}"]
             data = urllib.parse.urlencode({"chat_id": TG_CHAT_ID,
                                            "text": "\n".join(lines)}).encode()
             try:
@@ -294,7 +287,7 @@ def start_stream():
     log.info("Трансляция: %s", stream_url(local_ip()))
 
 
-# ================= ЗАПИСЬ =================
+# ================= КАМЕРА =================
 def open_camera():
     backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
     attempt = 0
@@ -314,21 +307,6 @@ def open_camera():
         time.sleep(2)
 
 
-def cleanup_old():
-    limit = datetime.now() - timedelta(days=RETENTION_DAYS)
-    for f in OUTPUT_DIR.glob("*.mp4"):
-        if datetime.fromtimestamp(f.stat().st_mtime) < limit:
-            f.unlink(missing_ok=True)
-            log.info("Удалена старая запись %s", f.name)
-
-
-def new_writer(w, h):
-    name = OUTPUT_DIR / f"cam_{datetime.now():%Y-%m-%d_%H-%M-%S}.mp4"
-    writer = cv2.VideoWriter(str(name), cv2.VideoWriter_fourcc(*"mp4v"), FPS, (w, h))
-    log.info("Новый файл: %s", name.name)
-    return writer
-
-
 def stamp(frame, h):
     text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     for color, thick in (((0, 0, 0), 4), ((255, 255, 255), 2)):
@@ -339,16 +317,11 @@ def stamp(frame, h):
 def run():
     global latest_frame
     log.info("=== Запуск ===")
-    cap = open_camera()
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or WIDTH
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or HEIGHT
-
     start_stream()
     notify_stream_started()
 
-    cleanup_old()
-    writer = new_writer(w, h)
-    segment_end = time.time() + SEGMENT_MINUTES * 60
+    cap = open_camera()
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or HEIGHT
     frame_interval = 1.0 / FPS
     fails = 0
     try:
@@ -361,23 +334,15 @@ def run():
                     log.error("Камера пропала, переподключение...")
                     cap.release()
                     cap = open_camera()
+                    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or HEIGHT
                     fails = 0
                 time.sleep(0.1)
                 continue
             fails = 0
 
-            if frame.shape[1] != w or frame.shape[0] != h:
-                frame = cv2.resize(frame, (w, h))
-            stamp(frame, h)
-            writer.write(frame)
+            stamp(frame, frame.shape[0])
             with frame_lock:
                 latest_frame = frame
-
-            if t0 >= segment_end:
-                writer.release()
-                cleanup_old()
-                writer = new_writer(w, h)
-                segment_end = time.time() + SEGMENT_MINUTES * 60
 
             dt = time.time() - t0
             if dt < frame_interval:
@@ -385,7 +350,6 @@ def run():
     except KeyboardInterrupt:
         log.info("Остановлено пользователем")
     finally:
-        writer.release()
         cap.release()
 
 
@@ -401,7 +365,7 @@ def main():
         if msgbox("Security Cam уже установлена и работает.\n\nУдалить её?", yes_no=True):
             uninstall() if is_admin() else elevate("--uninstall")
     else:
-        if msgbox("Установить Security Cam?\n\nКамера будет записывать видео при каждом "
+        if msgbox("Установить Security Cam?\n\nКамера будет транслироваться онлайн при каждом "
                   "включении ПК. Понадобятся права администратора.", yes_no=True):
             install() if is_admin() else elevate("--install")
 
