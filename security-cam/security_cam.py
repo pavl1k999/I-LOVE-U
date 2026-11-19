@@ -1,59 +1,235 @@
 """
-Security Cam — запись видео с веб-камеры при запуске ПК
-+ уведомления в Telegram + живая трансляция в браузер.
+Security Cam — один exe-файл.
 
-Все настройки — в config.ini рядом со скриптом.
-Требования:  pip install opencv-python requests
+Двойной щелчок по SecurityCam.exe:
+  * не установлено  -> устанавливает автозапуск при включении ПК и сразу начинает запись;
+  * уже установлено -> предлагает удалить.
+
+Запись видео идёт в папку recordings рядом с exe, живая трансляция — в браузере.
+Если в config.ini указан Telegram-бот, при старте трансляции придёт одно
+сообщение со ссылкой.
 """
 
+import os
 import sys
 import time
-import queue
+import json
 import base64
+import socket
+import secrets
 import logging
 import threading
+import subprocess
 import configparser
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 import cv2
 
-BASE = Path(__file__).resolve().parent
+APP = "SecurityCam"
+FROZEN = getattr(sys, "frozen", False)
+EXE = Path(sys.executable if FROZEN else __file__).resolve()
+BASE = EXE.parent
+CONFIG = BASE / "config.ini"
+OUTPUT_DIR = BASE / "recordings"
 
-# ---------------- НАСТРОЙКИ ----------------
-cfg = configparser.ConfigParser()
-cfg.read(BASE / "config.ini", encoding="utf-8")
+DEFAULT_CONFIG = """\
+; ===== Настройки Security Cam =====
+; После изменения перезагрузите ПК (или удалите и снова установите программу)
 
+[camera]
+index = 0
+width = 1280
+height = 720
+fps = 20
+
+[recording]
+segment_minutes = 10
+retention_days = 7
+
+[stream]
+port = 8080
+user = admin
+password = {password}
+
+[telegram]
+; Токен бота от @BotFather и ваш chat_id. Пусто — Telegram не используется.
+token =
+chat_id =
+"""
+
+
+# ================= КОНФИГ =================
+def load_config():
+    if not CONFIG.exists():
+        CONFIG.write_text(DEFAULT_CONFIG.format(password=secrets.token_urlsafe(8)),
+                          encoding="utf-8")
+    cfg = configparser.ConfigParser()
+    cfg.read(CONFIG, encoding="utf-8")
+    if not cfg.get("stream", "password", fallback="").strip():
+        cfg.set("stream", "password", secrets.token_urlsafe(8))
+        with open(CONFIG, "w", encoding="utf-8") as f:
+            cfg.write(f)
+    return cfg
+
+
+cfg = load_config()
 CAMERA_INDEX    = cfg.getint("camera", "index", fallback=0)
 WIDTH           = cfg.getint("camera", "width", fallback=1280)
 HEIGHT          = cfg.getint("camera", "height", fallback=720)
 FPS             = cfg.getint("camera", "fps", fallback=20)
 SEGMENT_MINUTES = cfg.getint("recording", "segment_minutes", fallback=10)
 RETENTION_DAYS  = cfg.getint("recording", "retention_days", fallback=7)
-
+STREAM_PORT     = cfg.getint("stream", "port", fallback=8080)
+STREAM_USER     = cfg.get("stream", "user", fallback="admin").strip()
+STREAM_PASS     = cfg.get("stream", "password", fallback="").strip()
 TG_TOKEN        = cfg.get("telegram", "token", fallback="").strip()
 TG_CHAT_ID      = cfg.get("telegram", "chat_id", fallback="").strip()
-TG_CLIP_SECONDS = cfg.getint("telegram", "start_clip_seconds", fallback=20)
-TG_SNAP_MINUTES = cfg.getint("telegram", "snapshot_every_minutes", fallback=0)
-
-STREAM_ON       = cfg.getboolean("stream", "enabled", fallback=True)
-STREAM_PORT     = cfg.getint("stream", "port", fallback=8080)
-STREAM_USER     = cfg.get("stream", "user", fallback="admin")
-STREAM_PASS     = cfg.get("stream", "password", fallback="").strip()
-
-OUTPUT_DIR = BASE / "recordings"
-# -------------------------------------------
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    filename=OUTPUT_DIR / "security_cam.log",
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+logging.basicConfig(filename=OUTPUT_DIR / "security_cam.log", level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cam")
-log.addHandler(logging.StreamHandler(sys.stdout))
+if sys.stdout:
+    log.addHandler(logging.StreamHandler(sys.stdout))
 
+
+# ================= УСТАНОВКА (Windows) =================
+def msgbox(text, yes_no=False):
+    import ctypes
+    flags = 0x40 | (0x04 if yes_no else 0)  # info icon (+ Yes/No)
+    return ctypes.windll.user32.MessageBoxW(None, text, APP, flags) == 6  # 6 = Yes
+
+
+def is_admin():
+    import ctypes
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def elevate(arg):
+    import ctypes
+    params = arg if FROZEN else f'"{EXE}" {arg}'
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, str(BASE), 1)
+
+
+def powershell(script):
+    flags = 0x08000000  # CREATE_NO_WINDOW
+    return subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                           "-Command", script], capture_output=True, text=True,
+                          creationflags=flags)
+
+
+def is_installed():
+    return powershell(f"Get-ScheduledTask -TaskName {APP} -ErrorAction Stop").returncode == 0
+
+
+def install():
+    exe, args = (str(EXE), "--run") if FROZEN else (sys.executable, f'"{EXE}" --run')
+    ps = f"""
+$ErrorActionPreference = 'Stop'
+$a = New-ScheduledTaskAction -Execute '{exe}' -Argument '{args}' -WorkingDirectory '{BASE}'
+$t = @((New-ScheduledTaskTrigger -AtStartup), (New-ScheduledTaskTrigger -AtLogOn))
+$p = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+     -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 `
+     -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -StartWhenAvailable
+Register-ScheduledTask -TaskName '{APP}' -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null
+Remove-NetFirewallRule -DisplayName '{APP} stream' -ErrorAction SilentlyContinue
+New-NetFirewallRule -DisplayName '{APP} stream' -Direction Inbound -Protocol TCP `
+    -LocalPort {STREAM_PORT} -Action Allow -Profile Private,Domain | Out-Null
+Start-ScheduledTask -TaskName '{APP}'
+"""
+    r = powershell(ps)
+    if r.returncode != 0:
+        msgbox("Не удалось установить:\n\n" + (r.stderr or r.stdout)[-800:])
+        return
+    msgbox("✅ Установлено! Запись уже идёт и будет включаться при каждом запуске ПК.\n\n"
+           f"Видео: {OUTPUT_DIR}\n\n"
+           f"Трансляция: {stream_url(local_ip())}\n"
+           f"Логин: {STREAM_USER}\nПароль: {STREAM_PASS}\n\n"
+           "(всё это есть в config.ini)")
+
+
+def uninstall():
+    powershell(f"""
+Stop-ScheduledTask -TaskName '{APP}' -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName '{APP}' -Confirm:$false -ErrorAction SilentlyContinue
+Remove-NetFirewallRule -DisplayName '{APP} stream' -ErrorAction SilentlyContinue
+""")
+    msgbox("Программа удалена из автозапуска, запись остановлена.\n"
+           "Записанные видео остались в папке recordings.")
+
+
+# ================= СЕТЬ / TELEGRAM =================
+def local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return "127.0.0.1"
+
+
+def tailscale_ip():
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            a, b = map(int, ip.split(".")[:2])
+            if a == 100 and 64 <= b <= 127:
+                return ip
+    except OSError:
+        pass
+    return None
+
+
+def stream_url(ip):
+    return f"http://{ip}:{STREAM_PORT}"
+
+
+def notify_stream_started():
+    """Одно сообщение в Telegram: трансляция началась + ссылка. Повторяет, пока нет интернета."""
+    if not (TG_TOKEN and TG_CHAT_ID):
+        return
+
+    def worker():
+        delay = 5
+        while True:
+            lines = [f"🔴 Трансляция началась ({datetime.now():%d.%m.%Y %H:%M})",
+                     stream_url(local_ip())]
+            ts = tailscale_ip()
+            if ts:
+                lines.append(stream_url(ts) + "  (через Tailscale)")
+            data = urllib.parse.urlencode({"chat_id": TG_CHAT_ID,
+                                           "text": "\n".join(lines)}).encode()
+            try:
+                with urllib.request.urlopen(
+                        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                        data=data, timeout=30) as r:
+                    if json.load(r).get("ok"):
+                        log.info("Telegram: сообщение отправлено")
+                        return
+            except urllib.error.HTTPError as e:
+                if e.code in (400, 401, 403, 404):
+                    log.error("Telegram: проверьте token/chat_id (%s)", e.code)
+                    return
+            except Exception as e:
+                log.warning("Telegram недоступен (%s), повтор через %d сек",
+                            e.__class__.__name__, delay)
+            time.sleep(delay)
+            delay = min(delay * 2, 300)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ================= ТРАНСЛЯЦИЯ =================
 latest_frame = None
 frame_lock = threading.Lock()
 
@@ -63,85 +239,6 @@ def get_frame():
         return None if latest_frame is None else latest_frame.copy()
 
 
-def jpeg(frame, quality=80):
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    return buf.tobytes() if ok else None
-
-
-# ================= TELEGRAM =================
-class Telegram:
-    def __init__(self, token, chat_id):
-        import requests
-        self.rq = requests
-        self.api = f"https://api.telegram.org/bot{token}/"
-        self.chat_id = str(chat_id)
-        self.q = queue.Queue()
-        threading.Thread(target=self._sender, daemon=True).start()
-        threading.Thread(target=self._commands, daemon=True).start()
-
-    # --- очередь отправки: при загрузке ПК интернета может ещё не быть, поэтому повторяем ---
-    def message(self, text):
-        self.q.put(("sendMessage", {"text": text}, None))
-
-    def photo(self, data, caption=""):
-        self.q.put(("sendPhoto", {"caption": caption}, ("photo", "snap.jpg", data)))
-
-    def video(self, path, caption=""):
-        self.q.put(("sendVideo", {"caption": caption}, ("video", path)))
-
-    def _sender(self):
-        while True:
-            method, data, file = self.q.get()
-            data = dict(data, chat_id=self.chat_id)
-            delay = 5
-            while True:
-                try:
-                    files = None
-                    if file and len(file) == 3:
-                        files = {file[0]: (file[1], file[2])}
-                    elif file:
-                        files = {file[0]: open(file[1], "rb")}
-                    r = self.rq.post(self.api + method, data=data, files=files, timeout=120)
-                    if files and len(file) == 2:
-                        files[file[0]].close()
-                    if r.ok:
-                        break
-                    log.warning("Telegram %s: %s", method, r.text[:200])
-                    if r.status_code in (400, 401, 403, 404):
-                        break  # ошибка настроек — повтор не поможет
-                except Exception as e:
-                    log.warning("Telegram недоступен (%s), повтор через %d сек", e.__class__.__name__, delay)
-                time.sleep(delay)
-                delay = min(delay * 2, 300)
-
-    # --- команды из чата: /photo, /status ---
-    def _commands(self):
-        offset = None
-        while True:
-            try:
-                r = self.rq.get(self.api + "getUpdates",
-                                params={"timeout": 50, "offset": offset}, timeout=60).json()
-                for upd in r.get("result", []):
-                    offset = upd["update_id"] + 1
-                    msg = upd.get("message") or {}
-                    if str(msg.get("chat", {}).get("id")) != self.chat_id:
-                        continue  # чужие сообщения игнорируем
-                    text = (msg.get("text") or "").strip().lower()
-                    if text.startswith(("/photo", "фото")):
-                        f = get_frame()
-                        if f is not None:
-                            self.photo(jpeg(f), datetime.now().strftime("%H:%M:%S"))
-                        else:
-                            self.message("Камера ещё не готова")
-                    elif text.startswith(("/status", "статус")):
-                        self.message("✅ Запись идёт. " + datetime.now().strftime("%d.%m %H:%M:%S"))
-                    elif text.startswith("/start"):
-                        self.message("Команды: /photo — снимок сейчас, /status — проверка")
-            except Exception:
-                time.sleep(10)
-
-
-# ================= ТРАНСЛЯЦИЯ =================
 class StreamHandler(BaseHTTPRequestHandler):
     auth = "Basic " + base64.b64encode(f"{STREAM_USER}:{STREAM_PASS}".encode()).decode()
 
@@ -171,7 +268,8 @@ class StreamHandler(BaseHTTPRequestHandler):
                 while True:
                     f = get_frame()
                     if f is not None:
-                        data = jpeg(f, 70)
+                        ok, buf = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                        data = buf.tobytes()
                         self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
                                          + str(len(data)).encode() + b"\r\n\r\n" + data + b"\r\n")
                     time.sleep(0.1)
@@ -183,22 +281,24 @@ class StreamHandler(BaseHTTPRequestHandler):
 
 
 def start_stream():
-    if not STREAM_ON:
-        return
-    if not STREAM_PASS:
-        log.warning("Трансляция выключена: задайте password в config.ini [stream]")
-        return
-    srv = ThreadingHTTPServer(("0.0.0.0", STREAM_PORT), StreamHandler)
+    while True:
+        try:
+            srv = ThreadingHTTPServer(("0.0.0.0", STREAM_PORT), StreamHandler)
+            break
+        except OSError as e:
+            log.warning("Порт %d занят (%s), повтор через 10 сек", STREAM_PORT, e)
+            time.sleep(10)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    log.info("Трансляция: http://<IP этого ПК>:%d", STREAM_PORT)
+    log.info("Трансляция: %s", stream_url(local_ip()))
 
 
 # ================= ЗАПИСЬ =================
 def open_camera():
+    backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
     attempt = 0
     while True:
         attempt += 1
-        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(CAMERA_INDEX, backend)
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
@@ -220,11 +320,11 @@ def cleanup_old():
             log.info("Удалена старая запись %s", f.name)
 
 
-def new_writer(w, h, prefix="cam"):
-    name = OUTPUT_DIR / f"{prefix}_{datetime.now():%Y-%m-%d_%H-%M-%S}.mp4"
+def new_writer(w, h):
+    name = OUTPUT_DIR / f"cam_{datetime.now():%Y-%m-%d_%H-%M-%S}.mp4"
     writer = cv2.VideoWriter(str(name), cv2.VideoWriter_fourcc(*"mp4v"), FPS, (w, h))
     log.info("Новый файл: %s", name.name)
-    return writer, name
+    return writer
 
 
 def stamp(frame, h):
@@ -234,32 +334,19 @@ def stamp(frame, h):
                     0.8, color, thick, cv2.LINE_AA)
 
 
-def main():
+def run():
     global latest_frame
-    boot_time = datetime.now()
-
-    tg = None
-    if TG_TOKEN and TG_CHAT_ID:
-        tg = Telegram(TG_TOKEN, TG_CHAT_ID)
-        tg.message(f"⚠️ ПК включён: {boot_time:%d.%m.%Y %H:%M:%S}")
-    start_stream()
-
+    log.info("=== Запуск ===")
     cap = open_camera()
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or WIDTH
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or HEIGHT
 
+    start_stream()
+    notify_stream_started()
+
     cleanup_old()
-    writer, _ = new_writer(w, h)
+    writer = new_writer(w, h)
     segment_end = time.time() + SEGMENT_MINUTES * 60
-
-    # короткий ролик в маленьком разрешении — для отправки в Telegram
-    clip_size = (640, int(640 * h / w))
-    clip_writer, clip_path = (new_writer(*clip_size, prefix="tgclip")
-                              if tg and TG_CLIP_SECONDS > 0 else (None, None))
-    clip_end = time.time() + TG_CLIP_SECONDS
-    first_photo_sent = False
-    next_snap = time.time() + TG_SNAP_MINUTES * 60 if TG_SNAP_MINUTES > 0 else None
-
     frame_interval = 1.0 / FPS
     fails = 0
     try:
@@ -284,24 +371,10 @@ def main():
             with frame_lock:
                 latest_frame = frame
 
-            if tg:
-                if not first_photo_sent:
-                    tg.photo(jpeg(frame), "Первый кадр после включения")
-                    first_photo_sent = True
-                if clip_writer:
-                    clip_writer.write(cv2.resize(frame, clip_size))
-                    if t0 >= clip_end:
-                        clip_writer.release()
-                        clip_writer = None
-                        tg.video(str(clip_path), f"Первые {TG_CLIP_SECONDS} сек после включения")
-                if next_snap and t0 >= next_snap:
-                    tg.photo(jpeg(frame), datetime.now().strftime("%H:%M:%S"))
-                    next_snap = t0 + TG_SNAP_MINUTES * 60
-
             if t0 >= segment_end:
                 writer.release()
                 cleanup_old()
-                writer, _ = new_writer(w, h)
+                writer = new_writer(w, h)
                 segment_end = time.time() + SEGMENT_MINUTES * 60
 
             dt = time.time() - t0
@@ -311,9 +384,24 @@ def main():
         log.info("Остановлено пользователем")
     finally:
         writer.release()
-        if clip_writer:
-            clip_writer.release()
         cap.release()
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg == "--run" or os.name != "nt":
+        run()
+    elif arg == "--install":
+        install()
+    elif arg == "--uninstall":
+        uninstall()
+    elif is_installed():
+        if msgbox("Security Cam уже установлена и работает.\n\nУдалить её?", yes_no=True):
+            uninstall() if is_admin() else elevate("--uninstall")
+    else:
+        if msgbox("Установить Security Cam?\n\nКамера будет записывать видео при каждом "
+                  "включении ПК. Понадобятся права администратора.", yes_no=True):
+            install() if is_admin() else elevate("--install")
 
 
 if __name__ == "__main__":

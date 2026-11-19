@@ -1,0 +1,36 @@
+name: Build SecurityCam.exe
+
+on:
+  push:
+    paths:
+      - "security-cam/**"
+      - ".github/workflows/build-securitycam.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install opencv-python pyinstaller
+      - name: Build exe
+        working-directory: security-cam
+        run: pyinstaller --onefile --noconsole --name SecurityCam security_cam.py
+      - name: Smoke test (imports, config creation)
+        working-directory: security-cam/dist
+        shell: pwsh
+        run: |
+          $p = Start-Process .\SecurityCam.exe -ArgumentList '--run' -PassThru
+          Start-Sleep 20
+          if ($p.HasExited) { Get-Content recordings\security_cam.log; throw "exe crashed" }
+          Stop-Process $p -Force
+          Get-Content recordings\security_cam.log
+          if (-not (Test-Path config.ini)) { throw "config.ini not created" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SecurityCam
+          path: security-cam/dist/SecurityCam.exe
