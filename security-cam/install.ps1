@@ -9,10 +9,10 @@ if (-not $py -or -not (Test-Path $py)) {
     Write-Host 'Python не найден. Установите Python 3 с python.org и отметьте "Add to PATH".' -ForegroundColor Red
     exit 1
 }
-& $py -c "import cv2" 2>$null
+& $py -c "import cv2, requests" 2>$null
 if ($LASTEXITCODE -ne 0) {
-    Write-Host 'Устанавливаю opencv-python...'
-    & $py -m pip install opencv-python
+    Write-Host 'Устанавливаю opencv-python и requests...'
+    & $py -m pip install opencv-python requests
 }
 Write-Host "Python: $py"
 
@@ -24,6 +24,15 @@ $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGo
              -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 `
              -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -StartWhenAvailable
 
+# Разрешаем трансляцию в брандмауэре (только домашняя/частная сеть)
+$port = 8080
+$m = Select-String -Path (Join-Path $dir 'config.ini') -Pattern '^\s*port\s*=\s*(\d+)'
+if ($m) { $port = [int]$m.Matches[0].Groups[1].Value }
+Remove-NetFirewallRule -DisplayName 'SecurityCam stream' -ErrorAction SilentlyContinue
+New-NetFirewallRule -DisplayName 'SecurityCam stream' -Direction Inbound -Protocol TCP `
+    -LocalPort $port -Action Allow -Profile Private | Out-Null
+
+Stop-ScheduledTask -TaskName 'SecurityCam' -ErrorAction SilentlyContinue
 Register-ScheduledTask -TaskName 'SecurityCam' -Action $action -Trigger $triggers `
     -Principal $principal -Settings $settings -Force | Out-Null
 Start-ScheduledTask -TaskName 'SecurityCam'
@@ -31,3 +40,5 @@ Start-ScheduledTask -TaskName 'SecurityCam'
 Write-Host ''
 Write-Host 'Готово! Запись уже идёт и будет начинаться при каждом включении ПК.' -ForegroundColor Green
 Write-Host "Видео: $dir\recordings"
+$ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.PrefixOrigin -in 'Dhcp','Manual' -and $_.IPAddress -notlike '169.*' } | Select-Object -First 1).IPAddress
+if ($ip) { Write-Host "Трансляция (если задан пароль в config.ini): http://${ip}:$port" }
