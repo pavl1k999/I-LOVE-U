@@ -23,7 +23,7 @@ WIDTH, HEIGHT = 1280, 720   # разрешение
 FPS = 20                    # кадров в секунду
 SEGMENT_MINUTES = 10        # длина одного файла
 RETENTION_DAYS = 7          # сколько дней хранить записи
-START_DELAY_SEC = 15        # пауза после запуска ПК, чтобы драйверы камеры успели загрузиться
+START_DELAY_SEC = 0         # пауза перед стартом (камера и так ждётся в цикле ниже)
 OUTPUT_DIR = Path(__file__).resolve().parent / "recordings"
 # -------------------------------------------
 
@@ -39,7 +39,9 @@ log.addHandler(logging.StreamHandler(sys.stdout))
 
 def open_camera():
     backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
-    for attempt in range(1, 11):
+    attempt = 0
+    while True:
+        attempt += 1
         cap = cv2.VideoCapture(CAMERA_INDEX, backend)
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
@@ -48,9 +50,10 @@ def open_camera():
             log.info("Камера открыта (попытка %d)", attempt)
             return cap
         cap.release()
-        log.warning("Камера недоступна, повтор через 5 сек (попытка %d)", attempt)
-        time.sleep(5)
-    raise RuntimeError("Не удалось открыть камеру")
+        # при загрузке Windows драйвер камеры может появиться не сразу — ждём, сколько нужно
+        if attempt <= 3 or attempt % 30 == 0:
+            log.warning("Камера недоступна, жду... (попытка %d)", attempt)
+        time.sleep(2)
 
 
 def cleanup_old():
